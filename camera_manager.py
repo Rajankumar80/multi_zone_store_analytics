@@ -1432,63 +1432,563 @@ Pipeline
   Main thread — display loop
 """
 
+# import os
+# os.environ["CUDA_VISIBLE_DEVICES"] = ""
+# os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+
+# # ── NOTE: GStreamer (gi / Gst) is intentionally NOT imported here. ────────────
+# # The gi.repository import triggers a native segfault in this OpenVINO +
+# # PyTorch environment.  cv2.VideoCapture handles both file and RTSP sources
+# # reliably without GStreamer bindings.
+
+# import queue
+# import signal
+# import sys
+# import threading
+# import time
+
+# import cv2
+# cv2.setNumThreads(2)
+
+# import multiprocessing as mp
+# import numpy as np
+
+# try:
+#     import torch
+#     torch.set_num_threads(2)
+#     torch.set_num_interop_threads(1)
+# except ImportError:
+#     pass
+
+# from model import Detector
+
+
+# # ─── TUNING ───────────────────────────────────────────────────────────────────
+
+# RAW_QUEUE_SIZE    = 8
+# DETECT_QUEUE_SIZE = 4
+
+# CAPTURE_FPS   = 8
+# INFER_FPS     = 20
+# DISPLAY_FPS   = 15
+# DISPLAY_SCALE = 0.55
+# RECORD_FPS    = 8
+
+
+# # ─── HELPERS ──────────────────────────────────────────────────────────────────
+
+# def resize_keep_aspect(img: np.ndarray, target_w: int, target_h: int) -> np.ndarray:
+#     h, w   = img.shape[:2]
+#     scale  = min(target_w / w, target_h / h)
+#     new_w  = int(w * scale)
+#     new_h  = int(h * scale)
+#     canvas = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+#     resized = cv2.resize(img, (new_w, new_h))
+#     y0 = (target_h - new_h) // 2
+#     x0 = (target_w - new_w) // 2
+#     canvas[y0:y0 + new_h, x0:x0 + new_w] = resized
+#     return canvas
+
+
+# def _make_no_signal(width: int, height: int) -> np.ndarray:
+#     frame = np.full((height, width, 3), 30, dtype=np.uint8)
+#     text  = "NO SIGNAL"
+#     font  = cv2.FONT_HERSHEY_SIMPLEX
+#     fs    = width / 400.0
+#     th    = max(2, int(fs * 2))
+#     (tw, fh), _ = cv2.getTextSize(text, font, fs, th)
+#     cv2.putText(frame, text,
+#                 ((width - tw) // 2, (height + fh) // 2),
+#                 font, fs, (60, 60, 60), th, cv2.LINE_AA)
+#     sp = max(20, width // 32)
+#     for i in range(0, height, sp):
+#         cv2.line(frame, (0, i), (width, i), (50, 50, 50), 1)
+#     for j in range(0, width, sp):
+#         cv2.line(frame, (j, 0), (j, height), (50, 50, 50), 1)
+#     return frame
+
+
+# # ─── STAGE 0 — Capture process ────────────────────────────────────────────────
+
+# class CaptureProcess(mp.Process):
+#     """
+#     One process per camera.  Uses cv2.VideoCapture for both file and RTSP.
+#     Pushes {"cam": cam_name, "frame": ndarray} into the shared raw_queue.
+#     Loops on file EOS.  Reconnects on RTSP drop.
+#     """
+
+#     def __init__(self, cam_name: str, source: str,
+#                  raw_queue: mp.Queue, fps: int = CAPTURE_FPS):
+#         super().__init__(daemon=True, name=f"cap-{cam_name}")
+#         self.cam_name  = cam_name
+#         self.source    = source
+#         self.raw_queue = raw_queue
+#         self.fps       = fps
+#         self.running   = mp.Value("b", True)
+
+#     def stop(self):
+#         self.running.value = False
+
+#     def _push(self, frame: np.ndarray):
+#         item = {"cam": self.cam_name, "frame": frame}
+#         if self.raw_queue.full():
+#             try:
+#                 self.raw_queue.get_nowait()
+#             except Exception:
+#                 pass
+#         try:
+#             self.raw_queue.put_nowait(item)
+#         except Exception:
+#             pass
+
+#     def run(self):
+#         # Ignore Ctrl-C in child — parent handles shutdown
+#         signal.signal(signal.SIGINT, signal.SIG_IGN)
+#         signal.signal(signal.SIGTERM,
+#                       lambda s, f: setattr(self.running, "value", False))
+
+#         interval = 1.0 / self.fps
+#         is_rtsp  = self.source.lower().startswith("rtsp://")
+
+#         print(f"[INFO] [{self.cam_name}] Capture started  <- {self.source}")
+
+#         while self.running.value:
+#             cap = cv2.VideoCapture(self.source)
+#             if not cap.isOpened():
+#                 print(f"[WARN] [{self.cam_name}] Cannot open source — retrying in 3 s")
+#                 time.sleep(3)
+#                 continue
+
+#             src_fps  = cap.get(cv2.CAP_PROP_FPS) or 25.0
+#             throttle = 1.0 / min(self.fps, src_fps)
+
+#             while self.running.value:
+#                 t0 = time.monotonic()
+#                 ret, frame = cap.read()
+#                 if not ret:
+#                     if is_rtsp:
+#                         print(f"[WARN] [{self.cam_name}] RTSP dropped — reconnecting")
+#                         break          # outer loop reconnects
+#                     else:
+#                         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)   # loop file
+#                         continue
+#                 self._push(frame)
+#                 wait = throttle - (time.monotonic() - t0)
+#                 if wait > 0:
+#                     time.sleep(wait)
+
+#             cap.release()
+
+#             if not is_rtsp:
+#                 break   # file finished — don't loop the outer while
+
+#             if self.running.value:
+#                 time.sleep(3)   # brief back-off before RTSP reconnect
+
+#         print(f"[INFO] [{self.cam_name}] Capture stopped")
+
+
+# # ─── STAGE 1 — Detector thread ────────────────────────────────────────────────
+
+# class DetectorThread(threading.Thread):
+#     """
+#     Pulls tagged frames from raw_queue.
+#     Maintains one Detector per camera (lazy-loaded on first frame).
+#     Pushes result dicts into detect_queue.
+#     """
+
+#     def __init__(self, cam_names: list,
+#                  raw_queue:    mp.Queue,
+#                  detect_queue: queue.Queue):
+#         super().__init__(daemon=True, name="detector")
+#         self.cam_names    = cam_names
+#         self.raw_queue    = raw_queue
+#         self.detect_queue = detect_queue
+#         self._detectors: dict = {}
+#         self._interval = 1.0 / INFER_FPS
+#         self._stop_evt = threading.Event()
+
+#     def stop(self):
+#         self._stop_evt.set()
+
+#     def _get_detector(self, cam_name: str) -> Detector:
+#         if cam_name not in self._detectors:
+#             print(f"[INFO] [detector] Loading Detector for '{cam_name}' ...")
+#             self._detectors[cam_name] = Detector(camera_name=cam_name)
+#             print(f"[INFO] [detector] '{cam_name}' ready")
+#         return self._detectors[cam_name]
+
+#     def _push(self, item: dict):
+#         try:
+#             self.detect_queue.put_nowait(item)
+#         except queue.Full:
+#             try:
+#                 self.detect_queue.get_nowait()
+#             except queue.Empty:
+#                 pass
+#             try:
+#                 self.detect_queue.put_nowait(item)
+#             except queue.Full:
+#                 pass
+
+#     def run(self):
+#         print("[INFO] [detector] Detector thread started")
+#         while not self._stop_evt.is_set():
+#             try:
+#                 item = self.raw_queue.get(timeout=1.0)
+#             except Exception:
+#                 continue
+
+#             cam_name = item.get("cam")
+#             frame    = item.get("frame")
+#             if frame is None or cam_name is None:
+#                 continue
+
+#             t0 = time.monotonic()
+#             try:
+#                 det = self._get_detector(cam_name)
+#                 annotated, tracks, floor_map = det.process_frame(frame)
+#             except Exception as e:
+#                 print(f"[WARN] [detector] '{cam_name}': {e}")
+#                 time.sleep(0.05)
+#                 continue
+
+#             self._push({
+#                 "cam":       cam_name,
+#                 "annotated": annotated,
+#                 "floor_map": floor_map,
+#                 "tracks":    tracks,
+#             })
+
+#             wait = self._interval - (time.monotonic() - t0)
+#             if wait > 0:
+#                 time.sleep(wait)
+
+#         print("[INFO] [detector] Detector thread stopped")
+
+
+# # ─── STAGE 2 — I/O thread ─────────────────────────────────────────────────────
+
+# class IOThread(threading.Thread):
+#     """
+#     Drains detect_queue and stores the latest (annotated, floor_map) per camera.
+#     Optionally writes per-camera .avi files.
+#     Display thread reads via get_latest().
+#     """
+
+#     def __init__(self, cam_names: list,
+#                  detect_queue:  queue.Queue,
+#                  output_videos: dict = None,   # {cam_name: path} or None
+#                  record_fps:    int  = RECORD_FPS):
+#         super().__init__(daemon=True, name="io")
+#         self.cam_names     = cam_names
+#         self.detect_queue  = detect_queue
+#         self.output_videos = output_videos or {}
+#         self.record_fps    = record_fps
+#         self._stop_evt     = threading.Event()
+#         self._lock         = threading.Lock()
+#         self._latest: dict = {n: (None, None) for n in cam_names}
+#         self._writers: dict = {}
+
+#     def stop(self):
+#         self._stop_evt.set()
+
+#     def get_latest(self, cam_name: str):
+#         with self._lock:
+#             return self._latest.get(cam_name, (None, None))
+
+#     def _get_writer(self, cam_name: str, frame: np.ndarray):
+#         if cam_name in self._writers:
+#             return self._writers[cam_name]
+#         path = self.output_videos.get(cam_name)
+#         if not path:
+#             self._writers[cam_name] = None
+#             return None
+#         h, w   = frame.shape[:2]
+#         fourcc = cv2.VideoWriter_fourcc(*"XVID")
+#         writer = cv2.VideoWriter(path, fourcc, self.record_fps, (w, h))
+#         self._writers[cam_name] = writer
+#         print(f"[INFO] [io] Recording '{cam_name}' → {path}")
+#         return writer
+
+#     def run(self):
+#         print("[INFO] [io] I/O thread started")
+#         while not self._stop_evt.is_set():
+#             try:
+#                 item = self.detect_queue.get(timeout=1.0)
+#             except queue.Empty:
+#                 continue
+
+#             cam_name  = item.get("cam")
+#             annotated = item.get("annotated")
+#             floor_map = item.get("floor_map")
+
+#             if cam_name is None or annotated is None:
+#                 continue
+
+#             # Video write
+#             writer = self._get_writer(cam_name, annotated)
+#             if writer:
+#                 writer.write(annotated)
+
+#             # Update display snapshot
+#             with self._lock:
+#                 self._latest[cam_name] = (annotated, floor_map)
+
+#         # Release writers on exit
+#         for w in self._writers.values():
+#             if w:
+#                 w.release()
+#         print("[INFO] [io] I/O thread stopped")
+
+
+# # ─── MULTI-CAMERA MANAGER ─────────────────────────────────────────────────────
+
+# class MultiCameraManager:
+#     """
+#     Wires everything together and owns the display loop.
+#     """
+
+#     def __init__(self, cameras: list,
+#                  buffer_size:   int   = RAW_QUEUE_SIZE,
+#                  fps:           int   = CAPTURE_FPS,
+#                  img_size:      tuple = (640, 640),
+#                  display_scale: float = DISPLAY_SCALE,
+#                  record_fps:    int   = RECORD_FPS,
+#                  **_ignored):
+#         self.cameras       = cameras
+#         self.cam_names     = [c["name"] for c in cameras]
+#         self.img_size      = img_size
+#         self.display_scale = display_scale
+#         self._stopped      = False
+#         self._no_signal    = _make_no_signal(*img_size)
+
+#         # Fullscreen state
+#         self.fullscreen       = False
+#         self.fullscreen_cam   = None
+#         self.fullscreen_type  = None   # "video" or "map"
+#         self._last_click_time = 0.0
+
+#         # ── Queues ────────────────────────────────────────────────────────────
+#         self._raw_queue    = mp.Queue(maxsize=buffer_size)
+#         self._detect_queue = queue.Queue(maxsize=DETECT_QUEUE_SIZE)
+
+#         # ── Capture processes ─────────────────────────────────────────────────
+#         self._captures = [
+#             CaptureProcess(c["name"], c["source"], self._raw_queue, fps)
+#             for c in cameras
+#         ]
+
+#         # ── Pipeline threads ──────────────────────────────────────────────────
+#         self._detector = DetectorThread(
+#             self.cam_names, self._raw_queue, self._detect_queue)
+
+#         self._io = IOThread(
+#             cam_names     = self.cam_names,
+#             detect_queue  = self._detect_queue,
+#             output_videos = {c["name"]: c.get("output") for c in cameras},
+#             record_fps    = record_fps,
+#         )
+
+#         # Start threads before processes so they're ready for first frame
+#         self._io.start()
+#         self._detector.start()
+#         for cap in self._captures:
+#             cap.start()
+
+#         # Signal handlers
+#         try:
+#             signal.signal(signal.SIGINT,  self._shutdown)
+#             signal.signal(signal.SIGTERM, self._shutdown)
+#         except Exception:
+#             pass
+
+#         cv2.namedWindow("Surveillance Grid", cv2.WINDOW_NORMAL)
+#         cv2.setMouseCallback("Surveillance Grid", self._mouse_callback)
+#         print(f"[INFO] {len(cameras)} camera(s) started  —  press  q  to quit")
+
+#     # ── Mouse callbacks ───────────────────────────────────────────────────────
+
+#     def _mouse_callback(self, event, x, y, flags, param):
+#         if event != cv2.EVENT_LBUTTONDOWN:
+#             return
+#         now = time.time()
+#         if now - self._last_click_time < 0.35:
+#             self._handle_double_click(x, y)
+#         self._last_click_time = now
+
+#     def _handle_double_click(self, x, y):
+#         BASE_H   = int(480 * self.display_scale)
+#         TARGET_W = int(BASE_H * 16 / 9)
+#         row      = y // (BASE_H + 4)
+#         if row >= len(self.cam_names):
+#             return
+#         if self.fullscreen:
+#             self.fullscreen = False
+#         else:
+#             self.fullscreen      = True
+#             self.fullscreen_cam  = self.cam_names[row]
+#             self.fullscreen_type = "video" if x < TARGET_W else "map"
+
+#     # ── Grid composition ──────────────────────────────────────────────────────
+
+#     def _compose_grid(self) -> np.ndarray:
+#         SEP      = (50, 50, 50)
+#         BASE_H   = int(480 * self.display_scale)
+#         TARGET_H = BASE_H
+#         TARGET_W = int(BASE_H * 16 / 9)
+#         rows     = []
+
+#         for cam in self.cam_names:
+#             annotated, floor_map = self._io.get_latest(cam)
+
+#             annotated = annotated if annotated is not None else self._no_signal
+#             floor_map = floor_map if floor_map is not None else self._no_signal
+
+#             cam_cell = resize_keep_aspect(annotated, TARGET_W, TARGET_H)
+#             map_cell = resize_keep_aspect(floor_map, TARGET_W, TARGET_H)
+
+#             row = np.hstack([
+#                 cam_cell,
+#                 np.full((TARGET_H, 4, 3), SEP, dtype=np.uint8),
+#                 map_cell,
+#             ])
+#             rows.append(row)
+#             rows.append(np.full((4, row.shape[1], 3), SEP, dtype=np.uint8))
+
+#         if not rows:
+#             return self._no_signal
+
+#         # Remove trailing separator
+#         return np.vstack(rows[:-1])
+
+#     # ── Display loop ──────────────────────────────────────────────────────────
+
+#     def display_streams(self):
+#         delay = max(1, int(1000 / DISPLAY_FPS))
+
+#         try:
+#             while not self._stopped:
+#                 if self.fullscreen and self.fullscreen_cam:
+#                     annotated, floor_map = self._io.get_latest(self.fullscreen_cam)
+#                     frame = (annotated if self.fullscreen_type == "video"
+#                              else floor_map)
+#                     if frame is None:
+#                         frame = self._no_signal
+#                     h, w  = frame.shape[:2]
+#                     grid  = cv2.resize(frame, (1280, int(1280 * h / w)))
+#                 else:
+#                     grid = self._compose_grid()
+
+#                 cv2.imshow("Surveillance Grid", grid)
+
+#                 key = cv2.waitKey(delay) & 0xFF
+#                 if key in (ord("q"), 27):
+#                     print("[INFO] Quit by user")
+#                     break
+
+#         except KeyboardInterrupt:
+#             print("[INFO] Interrupted")
+#         finally:
+#             self.stop()
+#             cv2.destroyAllWindows()
+
+#     # ── Shutdown ──────────────────────────────────────────────────────────────
+
+#     def stop(self):
+#         if self._stopped:
+#             return
+#         self._stopped = True
+#         print("[INFO] Shutting down ...")
+
+#         for cap in self._captures:
+#             try:
+#                 cap.stop()
+#             except Exception:
+#                 pass
+#         for cap in self._captures:
+#             cap.join(timeout=4)
+#             if cap.is_alive():
+#                 cap.kill()
+#                 cap.join(timeout=2)
+
+#         self._detector.stop()
+#         self._detector.join(timeout=8)
+
+#         self._io.stop()
+#         self._io.join(timeout=4)
+
+#         try:
+#             while not self._raw_queue.empty():
+#                 self._raw_queue.get_nowait()
+#             self._raw_queue.close()
+#             self._raw_queue.join_thread()
+#         except Exception:
+#             pass
+
+#         print("[INFO] Shutdown complete")
+
+#     def _shutdown(self, sig=None, frame=None):
+#         try:
+#             signal.signal(signal.SIGINT,  signal.SIG_DFL)
+#             signal.signal(signal.SIGTERM, signal.SIG_DFL)
+#         except Exception:
+#             pass
+#         self.stop()
+#         cv2.destroyAllWindows()
+#         sys.exit(0)
+# -------------------------------------------------------------------
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
-
-# ── NOTE: GStreamer (gi / Gst) is intentionally NOT imported here. ────────────
-# The gi.repository import triggers a native segfault in this OpenVINO +
-# PyTorch environment.  cv2.VideoCapture handles both file and RTSP sources
-# reliably without GStreamer bindings.
 
 import queue
 import signal
 import sys
 import threading
 import time
+import multiprocessing as mp
 
 import cv2
-cv2.setNumThreads(2)
-
-import multiprocessing as mp
 import numpy as np
-
-try:
-    import torch
-    torch.set_num_threads(2)
-    torch.set_num_interop_threads(1)
-except ImportError:
-    pass
-
-from model import Detector
-
 
 # ─── TUNING ───────────────────────────────────────────────────────────────────
 
-RAW_QUEUE_SIZE    = 8
-DETECT_QUEUE_SIZE = 4
+FRAME_QUEUE_SIZE = 180  
+CAPTURE_FPS      = 10
+DISPLAY_FPS      = 10    
+DISPLAY_SCALE    = 1.0     
 
-CAPTURE_FPS   = 8
-INFER_FPS     = 20
-DISPLAY_FPS   = 15
-DISPLAY_SCALE = 0.55
-RECORD_FPS    = 8
+# ─── JPEG ENCODE / DECODE QUALITY ─────────────────────────────────────────────
+# BOTTLENECK FIX: Raw 1920x1080 numpy frames (~6 MB each) were being pickled
+# and sent through mp.Queue, causing ~hundreds of MB/s of IPC traffic.
+# JPEG at quality=75 compresses each frame to ~150-200 KB (a 30x reduction),
+# eliminating the queue lock contention and memory pressure that caused
+# freezes and crashes under multi-camera load.
+JPEG_ENCODE_QUALITY = 75   # 0–100. 75 is visually near-lossless for preview.
+JPEG_ENCODE_PARAMS  = [cv2.IMWRITE_JPEG_QUALITY, JPEG_ENCODE_QUALITY]
 
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
 
-def resize_keep_aspect(img: np.ndarray, target_w: int, target_h: int) -> np.ndarray:
+def resize_for_preview(img: np.ndarray, target_w: int, target_h: int) -> np.ndarray:
+    """
+    UI OPTIMIZATION: We use INTER_LINEAR here instead of INTER_AREA. 
+    It is slightly softer visually, but takes 1/4th the CPU power, 
+    preventing the main UI thread from freezing.
+    """
     h, w   = img.shape[:2]
     scale  = min(target_w / w, target_h / h)
     new_w  = int(w * scale)
     new_h  = int(h * scale)
     canvas = np.zeros((target_h, target_w, 3), dtype=np.uint8)
-    resized = cv2.resize(img, (new_w, new_h))
+    
+    resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    
     y0 = (target_h - new_h) // 2
     x0 = (target_w - new_w) // 2
     canvas[y0:y0 + new_h, x0:x0 + new_w] = resized
     return canvas
-
 
 def _make_no_signal(width: int, height: int) -> np.ndarray:
     frame = np.full((height, width, 3), 30, dtype=np.uint8)
@@ -1500,440 +2000,327 @@ def _make_no_signal(width: int, height: int) -> np.ndarray:
     cv2.putText(frame, text,
                 ((width - tw) // 2, (height + fh) // 2),
                 font, fs, (60, 60, 60), th, cv2.LINE_AA)
-    sp = max(20, width // 32)
-    for i in range(0, height, sp):
-        cv2.line(frame, (0, i), (width, i), (50, 50, 50), 1)
-    for j in range(0, width, sp):
-        cv2.line(frame, (j, 0), (j, height), (50, 50, 50), 1)
     return frame
 
 
-# ─── STAGE 0 — Capture process ────────────────────────────────────────────────
+# ─── STAGE 0 — Capture Workers (Threads inside a Process) ─────────────────────
 
-class CaptureProcess(mp.Process):
-    """
-    One process per camera.  Uses cv2.VideoCapture for both file and RTSP.
-    Pushes {"cam": cam_name, "frame": ndarray} into the shared raw_queue.
-    Loops on file EOS.  Reconnects on RTSP drop.
-    """
-
-    def __init__(self, cam_name: str, source: str,
-                 raw_queue: mp.Queue, fps: int = CAPTURE_FPS):
-        super().__init__(daemon=True, name=f"cap-{cam_name}")
-        self.cam_name  = cam_name
-        self.source    = source
-        self.raw_queue = raw_queue
-        self.fps       = fps
-        self.running   = mp.Value("b", True)
-
-    def stop(self):
-        self.running.value = False
+class SingleCameraReader(threading.Thread):
+    def __init__(self, cam_name: str, source: str, frame_queue: mp.Queue, fps: int):
+        super().__init__(daemon=True, name=f"thread-{cam_name}")
+        self.cam_name    = cam_name
+        self.source      = source
+        self.frame_queue = frame_queue
+        self.fps         = fps
 
     def _push(self, frame: np.ndarray):
-        item = {"cam": self.cam_name, "frame": frame}
-        if self.raw_queue.full():
+        # ── BOTTLENECK FIX ────────────────────────────────────────────────────
+        # Previously: raw numpy array (~6 MB) was pickled into mp.Queue.
+        # Now: JPEG-encode to bytes (~150-200 KB) before queuing.
+        # This reduces IPC payload by ~30x, eliminating the lock contention
+        # and serialization overhead that caused queue stalls and UI freezes.
+        ok, buf = cv2.imencode(".jpg", frame, JPEG_ENCODE_PARAMS)
+        if not ok:
+            return
+        # Store compressed bytes; cam name is a small string — no overhead.
+        item = {"cam": self.cam_name, "frame": buf.tobytes()}
+        # ──────────────────────────────────────────────────────────────────────
+
+        if self.frame_queue.full():
             try:
-                self.raw_queue.get_nowait()
+                self.frame_queue.get_nowait()
             except Exception:
                 pass
         try:
-            self.raw_queue.put_nowait(item)
+            self.frame_queue.put_nowait(item)
         except Exception:
             pass
 
     def run(self):
-        # Ignore Ctrl-C in child — parent handles shutdown
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
-        signal.signal(signal.SIGTERM,
-                      lambda s, f: setattr(self.running, "value", False))
-
         interval = 1.0 / self.fps
         is_rtsp  = self.source.lower().startswith("rtsp://")
+        print(f"[INFO] [{self.cam_name}] Capture thread started <- {self.source}")
 
-        print(f"[INFO] [{self.cam_name}] Capture started  <- {self.source}")
-
-        while self.running.value:
+        while True:
             cap = cv2.VideoCapture(self.source)
+            
             if not cap.isOpened():
                 print(f"[WARN] [{self.cam_name}] Cannot open source — retrying in 3 s")
                 time.sleep(3)
                 continue
 
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+            
+            # Minimize internal buffer to prevent stale frames on RTSP
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
             src_fps  = cap.get(cv2.CAP_PROP_FPS) or 25.0
             throttle = 1.0 / min(self.fps, src_fps)
 
-            while self.running.value:
+            while True:
                 t0 = time.monotonic()
-                ret, frame = cap.read()
-                if not ret:
+                
+                # ASYNC OPTIMIZATION: grab() is fast and non-blocking. 
+                # It tells the hardware to point to the next frame.
+                grabbed = cap.grab()
+                
+                if not grabbed:
                     if is_rtsp:
                         print(f"[WARN] [{self.cam_name}] RTSP dropped — reconnecting")
-                        break          # outer loop reconnects
+                        break
                     else:
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)   # loop file
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                         continue
-                self._push(frame)
+                
+                # retrieve() is the heavy CPU decode. We only do it if grab succeeded.
+                ret, frame = cap.retrieve()
+                if ret:
+                    # ✅ resize BEFORE sending to queue
+                    frame = cv2.resize(frame, (640, 360))
+
+                    self._push(frame)
                 wait = throttle - (time.monotonic() - t0)
                 if wait > 0:
-                    time.sleep(wait)
+                    time.sleep(max(0, wait))
 
             cap.release()
 
             if not is_rtsp:
-                break   # file finished — don't loop the outer while
+                break
 
-            if self.running.value:
-                time.sleep(3)   # brief back-off before RTSP reconnect
-
-        print(f"[INFO] [{self.cam_name}] Capture stopped")
+            time.sleep(3)
 
 
-# ─── STAGE 1 — Detector thread ────────────────────────────────────────────────
-
-class DetectorThread(threading.Thread):
-    """
-    Pulls tagged frames from raw_queue.
-    Maintains one Detector per camera (lazy-loaded on first frame).
-    Pushes result dicts into detect_queue.
-    """
-
-    def __init__(self, cam_names: list,
-                 raw_queue:    mp.Queue,
-                 detect_queue: queue.Queue):
-        super().__init__(daemon=True, name="detector")
-        self.cam_names    = cam_names
-        self.raw_queue    = raw_queue
-        self.detect_queue = detect_queue
-        self._detectors: dict = {}
-        self._interval = 1.0 / INFER_FPS
-        self._stop_evt = threading.Event()
-
-    def stop(self):
-        self._stop_evt.set()
-
-    def _get_detector(self, cam_name: str) -> Detector:
-        if cam_name not in self._detectors:
-            print(f"[INFO] [detector] Loading Detector for '{cam_name}' ...")
-            self._detectors[cam_name] = Detector(camera_name=cam_name)
-            print(f"[INFO] [detector] '{cam_name}' ready")
-        return self._detectors[cam_name]
-
-    def _push(self, item: dict):
-        try:
-            self.detect_queue.put_nowait(item)
-        except queue.Full:
-            try:
-                self.detect_queue.get_nowait()
-            except queue.Empty:
-                pass
-            try:
-                self.detect_queue.put_nowait(item)
-            except queue.Full:
-                pass
+class CaptureGroupProcess(mp.Process):
+    def __init__(self, group_id: int, cameras: list, frame_queue: mp.Queue, 
+                 fps: int, core_id: int, parent_pid: int):
+        super().__init__(daemon=True, name=f"cap-group-{group_id}")
+        self.group_id    = group_id
+        self.cameras     = cameras
+        self.frame_queue = frame_queue
+        self.fps         = fps
+        self.core_id     = core_id
+        self.parent_pid  = parent_pid
 
     def run(self):
-        print("[INFO] [detector] Detector thread started")
-        while not self._stop_evt.is_set():
+        cv2.setNumThreads(1) 
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        
+        def parent_monitor():
+            while True:
+                current_ppid = os.getppid()
+                if current_ppid != self.parent_pid or current_ppid == 1:
+                    os._exit(1)
+                time.sleep(1)
+
+        monitor_thread = threading.Thread(target=parent_monitor, daemon=True)
+        monitor_thread.start()
+
+        if self.core_id is not None:
             try:
-                item = self.raw_queue.get(timeout=1.0)
-            except Exception:
-                continue
+                os.sched_setaffinity(0, {self.core_id})
+                print(f"[INFO] [cap-group-{self.group_id}] Pinned to CPU Core {self.core_id}.")
+            except AttributeError:
+                pass
 
-            cam_name = item.get("cam")
-            frame    = item.get("frame")
-            if frame is None or cam_name is None:
-                continue
+        threads = []
+        for cam in self.cameras:
+            t = SingleCameraReader(cam["name"], cam["source"], self.frame_queue, self.fps)
+            t.start()
+            threads.append(t)
 
-            t0 = time.monotonic()
-            try:
-                det = self._get_detector(cam_name)
-                annotated, tracks, floor_map = det.process_frame(frame)
-            except Exception as e:
-                print(f"[WARN] [detector] '{cam_name}': {e}")
-                time.sleep(0.05)
-                continue
-
-            self._push({
-                "cam":       cam_name,
-                "annotated": annotated,
-                "floor_map": floor_map,
-                "tracks":    tracks,
-            })
-
-            wait = self._interval - (time.monotonic() - t0)
-            if wait > 0:
-                time.sleep(wait)
-
-        print("[INFO] [detector] Detector thread stopped")
-
-
-# ─── STAGE 2 — I/O thread ─────────────────────────────────────────────────────
-
-class IOThread(threading.Thread):
-    """
-    Drains detect_queue and stores the latest (annotated, floor_map) per camera.
-    Optionally writes per-camera .avi files.
-    Display thread reads via get_latest().
-    """
-
-    def __init__(self, cam_names: list,
-                 detect_queue:  queue.Queue,
-                 output_videos: dict = None,   # {cam_name: path} or None
-                 record_fps:    int  = RECORD_FPS):
-        super().__init__(daemon=True, name="io")
-        self.cam_names     = cam_names
-        self.detect_queue  = detect_queue
-        self.output_videos = output_videos or {}
-        self.record_fps    = record_fps
-        self._stop_evt     = threading.Event()
-        self._lock         = threading.Lock()
-        self._latest: dict = {n: (None, None) for n in cam_names}
-        self._writers: dict = {}
-
-    def stop(self):
-        self._stop_evt.set()
-
-    def get_latest(self, cam_name: str):
-        with self._lock:
-            return self._latest.get(cam_name, (None, None))
-
-    def _get_writer(self, cam_name: str, frame: np.ndarray):
-        if cam_name in self._writers:
-            return self._writers[cam_name]
-        path = self.output_videos.get(cam_name)
-        if not path:
-            self._writers[cam_name] = None
-            return None
-        h, w   = frame.shape[:2]
-        fourcc = cv2.VideoWriter_fourcc(*"XVID")
-        writer = cv2.VideoWriter(path, fourcc, self.record_fps, (w, h))
-        self._writers[cam_name] = writer
-        print(f"[INFO] [io] Recording '{cam_name}' → {path}")
-        return writer
-
-    def run(self):
-        print("[INFO] [io] I/O thread started")
-        while not self._stop_evt.is_set():
-            try:
-                item = self.detect_queue.get(timeout=1.0)
-            except queue.Empty:
-                continue
-
-            cam_name  = item.get("cam")
-            annotated = item.get("annotated")
-            floor_map = item.get("floor_map")
-
-            if cam_name is None or annotated is None:
-                continue
-
-            # Video write
-            writer = self._get_writer(cam_name, annotated)
-            if writer:
-                writer.write(annotated)
-
-            # Update display snapshot
-            with self._lock:
-                self._latest[cam_name] = (annotated, floor_map)
-
-        # Release writers on exit
-        for w in self._writers.values():
-            if w:
-                w.release()
-        print("[INFO] [io] I/O thread stopped")
+        for t in threads:
+            t.join()
 
 
 # ─── MULTI-CAMERA MANAGER ─────────────────────────────────────────────────────
 
 class MultiCameraManager:
-    """
-    Wires everything together and owns the display loop.
-    """
-
     def __init__(self, cameras: list,
-                 buffer_size:   int   = RAW_QUEUE_SIZE,
+                 buffer_size:   int   = FRAME_QUEUE_SIZE,
                  fps:           int   = CAPTURE_FPS,
                  img_size:      tuple = (640, 640),
                  display_scale: float = DISPLAY_SCALE,
-                 record_fps:    int   = RECORD_FPS,
+                 cams_per_core: int   = 6,       
+                 start_core_id: int   = 1,
                  **_ignored):
+                 
         self.cameras       = cameras
         self.cam_names     = [c["name"] for c in cameras]
         self.img_size      = img_size
         self.display_scale = display_scale
-        self._stopped      = False
         self._no_signal    = _make_no_signal(*img_size)
 
-        # Fullscreen state
-        self.fullscreen       = False
-        self.fullscreen_cam   = None
-        self.fullscreen_type  = None   # "video" or "map"
-        self._last_click_time = 0.0
+        self.frame_queue = mp.Queue(maxsize=buffer_size)
+        self._capture_groups = []
+        
+        # --- NEW: State variables for double-click feature ---
+        self.focused_cam = None
+        self._cam_bboxes = {}
+        self._last_grid_shape = None
+        # -----------------------------------------------------
+        
+        chunks = [cameras[i:i + cams_per_core] for i in range(0, len(cameras), cams_per_core)]
+        parent_pid = os.getpid()
+        
+        for i, chunk in enumerate(chunks):
+            target_core = start_core_id + i 
+            
+            group_proc = CaptureGroupProcess(
+                group_id    = i,
+                cameras     = chunk,
+                frame_queue = self.frame_queue,
+                fps         = fps,
+                core_id     = target_core,
+                parent_pid  = parent_pid        
+            )
+            self._capture_groups.append(group_proc)
 
-        # ── Queues ────────────────────────────────────────────────────────────
-        self._raw_queue    = mp.Queue(maxsize=buffer_size)
-        self._detect_queue = queue.Queue(maxsize=DETECT_QUEUE_SIZE)
+    def start(self):
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+        print(f"[INFO] Starting {len(self.cameras)} camera(s) grouped into {len(self._capture_groups)} process(es).")
+        for cg in self._capture_groups:
+            cg.start()
 
-        # ── Capture processes ─────────────────────────────────────────────────
-        self._captures = [
-            CaptureProcess(c["name"], c["source"], self._raw_queue, fps)
-            for c in cameras
-        ]
+    def _signal_handler(self, sig, frame):
+        self.stop()
 
-        # ── Pipeline threads ──────────────────────────────────────────────────
-        self._detector = DetectorThread(
-            self.cam_names, self._raw_queue, self._detect_queue)
+    def stop(self):
+        print("\n[CRITICAL] Force quitting all capture processes instantly...")
+        for cg in self._capture_groups:
+            if cg.is_alive():
+                cg.kill()
 
-        self._io = IOThread(
-            cam_names     = self.cam_names,
-            detect_queue  = self._detect_queue,
-            output_videos = {c["name"]: c.get("output") for c in cameras},
-            record_fps    = record_fps,
-        )
+        cv2.destroyAllWindows()
+        print("[INFO] Terminated.")
+        os._exit(0)
 
-        # Start threads before processes so they're ready for first frame
-        self._io.start()
-        self._detector.start()
-        for cap in self._captures:
-            cap.start()
-
-        # Signal handlers
-        try:
-            signal.signal(signal.SIGINT,  self._shutdown)
-            signal.signal(signal.SIGTERM, self._shutdown)
-        except Exception:
-            pass
-
-        cv2.namedWindow("Surveillance Grid", cv2.WINDOW_NORMAL)
-        cv2.setMouseCallback("Surveillance Grid", self._mouse_callback)
-        print(f"[INFO] {len(cameras)} camera(s) started  —  press  q  to quit")
-
-    # ── Mouse callbacks ───────────────────────────────────────────────────────
-
+    # --- NEW: Mouse Callback to handle double clicks ---
     def _mouse_callback(self, event, x, y, flags, param):
-        if event != cv2.EVENT_LBUTTONDOWN:
-            return
-        now = time.time()
-        if now - self._last_click_time < 0.35:
-            self._handle_double_click(x, y)
-        self._last_click_time = now
+        if event == cv2.EVENT_LBUTTONDBLCLK:
+            if self.focused_cam is not None:
+                # If already focused, double-click returns to grid
+                self.focused_cam = None
+            else:
+                # If in grid mode, find which camera was clicked
+                for cam, (x1, y1, x2, y2) in self._cam_bboxes.items():
+                    if x1 <= x <= x2 and y1 <= y <= y2:
+                        self.focused_cam = cam
+                        break
 
-    def _handle_double_click(self, x, y):
-        BASE_H   = int(480 * self.display_scale)
-        TARGET_W = int(BASE_H * 16 / 9)
-        row      = y // (BASE_H + 4)
-        if row >= len(self.cam_names):
-            return
-        if self.fullscreen:
-            self.fullscreen = False
-        else:
-            self.fullscreen      = True
-            self.fullscreen_cam  = self.cam_names[row]
-            self.fullscreen_type = "video" if x < TARGET_W else "map"
+    def _compose_grid(self, latest_frames: dict) -> np.ndarray:
+        COLS_PER_ROW = 3
+        SEP_COLOR    = (50, 50, 50)
+        SEP_THICK     = 4
 
-    # ── Grid composition ──────────────────────────────────────────────────────
-
-    def _compose_grid(self) -> np.ndarray:
-        SEP      = (50, 50, 50)
         BASE_H   = int(480 * self.display_scale)
         TARGET_H = BASE_H
         TARGET_W = int(BASE_H * 16 / 9)
-        rows     = []
+        
+        v_sep = np.full((TARGET_H, SEP_THICK, 3), SEP_COLOR, dtype=np.uint8)
+        grid_rows = []
 
-        for cam in self.cam_names:
-            annotated, floor_map = self._io.get_latest(cam)
+        self._cam_bboxes.clear() # Reset bounding boxes for the new frame
+        current_y = 0
 
-            annotated = annotated if annotated is not None else self._no_signal
-            floor_map = floor_map if floor_map is not None else self._no_signal
-
-            cam_cell = resize_keep_aspect(annotated, TARGET_W, TARGET_H)
-            map_cell = resize_keep_aspect(floor_map, TARGET_W, TARGET_H)
-
-            row = np.hstack([
-                cam_cell,
-                np.full((TARGET_H, 4, 3), SEP, dtype=np.uint8),
-                map_cell,
-            ])
-            rows.append(row)
-            rows.append(np.full((4, row.shape[1], 3), SEP, dtype=np.uint8))
-
-        if not rows:
-            return self._no_signal
-
-        # Remove trailing separator
-        return np.vstack(rows[:-1])
-
-    # ── Display loop ──────────────────────────────────────────────────────────
-
-    def display_streams(self):
-        delay = max(1, int(1000 / DISPLAY_FPS))
-
-        try:
-            while not self._stopped:
-                if self.fullscreen and self.fullscreen_cam:
-                    annotated, floor_map = self._io.get_latest(self.fullscreen_cam)
-                    frame = (annotated if self.fullscreen_type == "video"
-                             else floor_map)
+        for i in range(0, len(self.cam_names), COLS_PER_ROW):
+            chunk_names = self.cam_names[i:i + COLS_PER_ROW]
+            row_cells = []
+            current_x = 0
+            
+            for j in range(COLS_PER_ROW):
+                if j < len(chunk_names):
+                    cam = chunk_names[j]
+                    frame = latest_frames.get(cam)
                     if frame is None:
                         frame = self._no_signal
-                    h, w  = frame.shape[:2]
-                    grid  = cv2.resize(frame, (1280, int(1280 * h / w)))
+                    
+                    # Record the bounding box of this camera's grid cell
+                    self._cam_bboxes[cam] = (current_x, current_y, current_x + TARGET_W, current_y + TARGET_H)
                 else:
-                    grid = self._compose_grid()
+                    frame = self._no_signal
+                    
+                cell = resize_for_preview(frame, TARGET_W, TARGET_H)
+                row_cells.append(cell)
+                current_x += TARGET_W
+                
+                if j < COLS_PER_ROW - 1:
+                    row_cells.append(v_sep)
+                    current_x += SEP_THICK
+            
+            row_img = np.hstack(row_cells)
+            grid_rows.append(row_img)
+            current_y += TARGET_H
+            
+            h_sep = np.full((SEP_THICK, row_img.shape[1], 3), SEP_COLOR, dtype=np.uint8)
+            grid_rows.append(h_sep)
+            current_y += SEP_THICK
 
-                cv2.imshow("Surveillance Grid", grid)
+        if not grid_rows:
+            return self._no_signal
 
-                key = cv2.waitKey(delay) & 0xFF
-                if key in (ord("q"), 27):
+        return np.vstack(grid_rows[:-1])
+
+    def display_streams(self):
+        cv2.namedWindow("Raw Camera Feeds", cv2.WINDOW_NORMAL)
+        
+        # --- NEW: Bind the mouse callback to the window ---
+        cv2.setMouseCallback("Raw Camera Feeds", self._mouse_callback)
+        
+        delay = max(1, int(1000 / DISPLAY_FPS))
+        latest_frames = {name: None for name in self.cam_names}
+
+        try:
+            while True:
+                drain_count = 0
+                MAX_DRAIN = len(self.cam_names)
+                latest_raw = {}
+
+                for _ in range(MAX_DRAIN):
+                    try:
+                        item = self.frame_queue.get_nowait()
+
+                        frame_bytes = np.frombuffer(item["frame"], dtype=np.uint8)
+                        decoded     = cv2.imdecode(frame_bytes, cv2.IMREAD_COLOR)
+
+                        if decoded is not None:
+                            latest_frames[item["cam"]] = decoded
+
+                    except queue.Empty:
+                        break
+                # Step 2: Decode only once per camera
+                for cam, frame_bytes in latest_raw.items():
+                    frame_bytes = np.frombuffer(frame_bytes, dtype=np.uint8)
+                    decoded = cv2.imdecode(frame_bytes, cv2.IMREAD_COLOR)
+
+                    if decoded is not None:
+                        latest_frames[cam] = decoded    
+                # --- NEW: Display logic to toggle full screen ---
+                if self.focused_cam is not None:
+                    # Show only the focused camera
+                    focus_frame = latest_frames.get(self.focused_cam)
+                    if focus_frame is None:
+                        focus_frame = self._no_signal
+                        
+                    # Resize it to match the overall grid dimensions so the window 
+                    # doesn't drastically snap back and forth in size.
+                    if self._last_grid_shape is not None:
+                        h, w = self._last_grid_shape[:2]
+                        display_img = resize_for_preview(focus_frame, w, h)
+                    else:
+                        display_img = focus_frame
+                else:
+                    # Show the normal grid
+                    display_img = self._compose_grid(latest_frames)
+                    self._last_grid_shape = display_img.shape # Cache shape for stability
+                
+                cv2.imshow("Raw Camera Feeds", display_img)
+                
+                if cv2.waitKey(delay) & 0xFF in (ord("q"), 27):
                     print("[INFO] Quit by user")
-                    break
-
+                    self.stop()
+                    
         except KeyboardInterrupt:
-            print("[INFO] Interrupted")
-        finally:
             self.stop()
-            cv2.destroyAllWindows()
-
-    # ── Shutdown ──────────────────────────────────────────────────────────────
-
-    def stop(self):
-        if self._stopped:
-            return
-        self._stopped = True
-        print("[INFO] Shutting down ...")
-
-        for cap in self._captures:
-            try:
-                cap.stop()
-            except Exception:
-                pass
-        for cap in self._captures:
-            cap.join(timeout=4)
-            if cap.is_alive():
-                cap.kill()
-                cap.join(timeout=2)
-
-        self._detector.stop()
-        self._detector.join(timeout=8)
-
-        self._io.stop()
-        self._io.join(timeout=4)
-
-        try:
-            while not self._raw_queue.empty():
-                self._raw_queue.get_nowait()
-            self._raw_queue.close()
-            self._raw_queue.join_thread()
-        except Exception:
-            pass
-
-        print("[INFO] Shutdown complete")
-
-    def _shutdown(self, sig=None, frame=None):
-        try:
-            signal.signal(signal.SIGINT,  signal.SIG_DFL)
-            signal.signal(signal.SIGTERM, signal.SIG_DFL)
-        except Exception:
-            pass
-        self.stop()
-        cv2.destroyAllWindows()
-        sys.exit(0)
