@@ -88,61 +88,52 @@
 # if __name__ == "__main__":
 #     main()
 # -------------------------------------------------------------------------
-"""
-main.py — Entry point for multi-camera surveillance pipeline.
+import os
 
-All stream capture (GStreamer), inference, and display logic lives in
-camera_manager.py. This file only declares camera sources and kicks off
-the manager.
-
-Architecture (handled entirely by MultiCameraManager):
-──────────────────────────────────────────────────────
-  ┌───────────────────────────────────────────────────┐
-  │  Per-camera StreamProcessor (multiprocessing)     │
-  │  GStreamer RTSP/file pipeline → frame_queue       │
-  └──────────────────┬────────────────────────────────┘
-                     │  raw frames
-  ┌──────────────────▼────────────────────────────────┐
-  │  MultiCameraManager — main process                │
-  │  Pulls frames → Detector(cam_name).process_frame  │
-  │  CPU-only inference (no CUDA)                     │
-  └──────────────────┬────────────────────────────────┘
-                     │  (annotated_frame, floor_map)
-  ┌──────────────────▼────────────────────────────────┐
-  │  DisplayGrid — side-by-side [cam | floor_map]     │
-  │  Stays open after streams end — press q to quit   │
-  └───────────────────────────────────────────────────┘
-"""
+# ─── PIN MAIN THREAD TO CORE 0 ───────────────────────────────────────────────
+# The OS scheduler was freely migrating the display/UI thread across multiple
+# cores, causing variable CPU usage. We hard-pin the main process to core 0
+# so it never moves. Capture processes start from core 1 (start_core_id=1)
+# and are pinned to their own cores inside CaptureGroupProcess.run().
+try:
+    os.sched_setaffinity(0, {0})
+    print("[INFO] Main thread pinned to CPU Core 0.")
+except AttributeError:
+    # Windows does not support sched_setaffinity — silently skip.
+    print("[WARN] sched_setaffinity not supported on this OS — core pinning skipped.")
 
 from camera_manager import MultiCameraManager
 
 # ─── CAMERA SOURCES ──────────────────────────────────────────────────────────
-# Each entry spawns its own GStreamer capture process and its own Detector.
-# "name" must match the key in zones_runtime.json for correct zone loading.
-# Use "source" for RTSP URLs or local file paths.
+# Every camera MUST have a completely unique "name" so the dictionary
+# doesn't overwrite the frames.
 
 CAMERAS = [
     {
         "name":   "cam_entry",
-        # "source": "rtsp://10.64.36.14:554/rtsp/streaming?channel=01&subtype=1",
-        "source": "/home/keshav/rajan/new_pipeline/input/shopping.mp4",
-        "output": "/home/keshav/rajan/new_pipeline/output_videos/cam_entry_output.avi",
+        "source": "/home/keshav/rajan/reid_testing/store.mp4",
     },
-    # {
-    #     "name":   "cam_exit",
-    #     # "source": "rtsp://10.64.36.15:554/rtsp/streaming?channel=01&subtype=1",
-    #     "source": "/home/keshav/rajan/new_pipeline/input/shopping.mp4",
-    #     "output": "/home/keshav/rajan/new_pipeline/output_videos/cam_exit_output.avi",
-    # },
+    {
+        "name":   "cam_exit_1",
+        "source": "/home/keshav/rajan/reid_testing/cam_test/shopping.mp4",
+    },
+    {
+        "name":   "cam_exit_2",
+        "source": "/home/keshav/rajan/reid_testing/cam_test/shopping.mp4",
+    },
+    {
+        "name":   "cam_exit_3",
+        "source": "/home/keshav/rajan/reid_testing/cam_test/shopping.mp4",
+    },
+    {
+        "name":   "cam_exit_4",
+        "source": "/home/keshav/rajan/reid_testing/cam_test/shopping.mp4",
+    },
+    {
+        "name":   "cam_exit_5",
+        "source": "/home/keshav/rajan/reid_testing/cam_test/shopping.mp4",
+    },
 ]
-
-# ─── TUNING ───────────────────────────────────────────────────────────────────
-
-DISPLAY_SCALE  = 0.5    # scale each cell before compositing
-RECORD_FPS     = 8       # output .avi frames-per-second
-IMG_SIZE       = (640, 640)
-BUFFER_SIZE    = 2       # per-camera GStreamer frame queue depth
-STREAM_FPS     = 10     # target decode FPS for file/RTSP sources
 
 
 # ─── ENTRY POINT ─────────────────────────────────────────────────────────────
@@ -153,14 +144,17 @@ def main():
         return
 
     manager = MultiCameraManager(
-        cameras       = CAMERAS,
-        buffer_size   = BUFFER_SIZE,
-        fps           = STREAM_FPS,
-        img_size      = IMG_SIZE,
-        display_scale = DISPLAY_SCALE,
-        record_fps    = RECORD_FPS,
+        cameras        = CAMERAS,
+        cams_per_core  = 2,
+        display_scale  = 1.0,
+        start_core_id  = 1,   # ← capture groups get cores 1, 2, 3 …
+                               #   core 0 is reserved exclusively for main thread
     )
 
+    # Start all capture sub-processes
+    manager.start()
+
+    # Blocks main thread and runs the display loop (stays on core 0)
     manager.display_streams()
 
 
